@@ -1,19 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
-import httpx, os, json, io
+import httpx, os, json, io, base64
 from dotenv import load_dotenv
-from PIL import Image
 import PyPDF2
 
 # CORS
 from fastapi.middleware.cors import CORSMiddleware
-
-# Optional OCR
-try:
-    import pytesseract
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
 
 load_dotenv()
 
@@ -24,7 +16,7 @@ OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY")
 if not OLLAMA_HOST or not OLLAMA_MODEL:
     raise RuntimeError("Missing OLLAMA_HOST or OLLAMA_MODEL in .env")
 
-app = FastAPI(title="Gemma4 Chat Service", version="2.1.0")
+app = FastAPI(title="Gemma4 Chat Service", version="2.2.0")
 
 # ---------- CORS CONFIG ----------
 origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
@@ -54,7 +46,7 @@ class ChatRequest(BaseModel):
     message: str
 
 
-# ---------- LLM CALL ----------
+# ---------- LLM CALL (text only) ----------
 async def call_llm(prompt: str):
     async with httpx.AsyncClient(timeout=120) as client:
         try:
@@ -63,6 +55,45 @@ async def call_llm(prompt: str):
                 json={
                     "model": OLLAMA_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                },
+                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"LLM connection failed: {str(e)}")
+
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+
+        try:
+            lines = [l for l in r.text.strip().splitlines() if l.strip()]
+            parsed = [json.loads(l) for l in lines]
+            content = "".join(p.get("message", {}).get("content", "") for p in parsed)
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid response from LLM")
+
+        return {"response": content}
+
+
+# ---------- LLM CALL (image + text) ----------
+async def call_llm_with_image(prompt: str, image_b64: str):
+    """
+    Send image directly to Gemma4 as base64.
+    Gemma4 is multimodal — no OCR needed, it understands images natively.
+    """
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            r = await client.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [image_b64],   # base64 string, no data URI prefix
+                        }
+                    ],
                     "stream": False,
                 },
                 headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
@@ -99,48 +130,49 @@ async def chat_file(file: UploadFile = File(...), message: str = Form("")):
     size_mb = len(file_bytes) / (1024 * 1024)
 
     if size_mb > MAX_FILE_SIZE_MB:
-        raise HTTPException(status_code=413, detail="File too large")
-
-    content = ""
+        raise HTTPException(status_code=413, detail="File too large (max 5MB)")
 
     try:
-        # IMAGE
-        if file.content_type.startswith("image"):
-            if not OCR_AVAILABLE:
-                content = "[OCR not available - install pytesseract]"
-            else:
-                image = Image.open(io.BytesIO(file_bytes))
-                content = pytesseract.image_to_string(image)
+        # ── IMAGE → send directly to Gemma4 as base64 ──────────────────────
+        if file.content_type and file.content_type.startswith("image"):
+            image_b64 = base64.b64encode(file_bytes).decode("utf-8")
+            prompt = message.strip() if message.strip() else "Describe this image in detail."
+            return await call_llm_with_image(prompt, image_b64)
 
-        # PDF
+        # ── PDF → extract text → send to Gemma4 ────────────────────────────
         elif file.content_type == "application/pdf":
             reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            extracted = ""
             for page in reader.pages:
-                content += page.extract_text() or ""
+                extracted += page.extract_text() or ""
 
-        # AUDIO
-        elif file.content_type.startswith("audio"):
-            content = "[Audio received - transcription not implemented]"
+            if not extracted.strip():
+                raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
 
-        # VIDEO
-        elif file.content_type.startswith("video"):
-            content = "[Video received - processing not implemented]"
+            prompt = f"""User Message:\n{message}\n\nPDF Content:\n{extracted[:6000]}"""
+            return await call_llm(prompt)
+
+        # ── AUDIO ───────────────────────────────────────────────────────────
+        elif file.content_type and file.content_type.startswith("audio"):
+            raise HTTPException(
+                status_code=400,
+                detail="Audio transcription not supported. Use /voice/transcribe endpoint."
+            )
+
+        # ── VIDEO ───────────────────────────────────────────────────────────
+        elif file.content_type and file.content_type.startswith("video"):
+            raise HTTPException(
+                status_code=400,
+                detail="Video processing not supported yet."
+            )
 
         else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"File processing failed: {str(e)}")
-
-    final_prompt = f"""
-User Message:
-{message}
-
-Extracted Content:
-{content}
-"""
-
-    return await call_llm(final_prompt)
 
 
 # ---------- HEALTH ----------
