@@ -39,7 +39,8 @@ SHORT_TERM_TURNS: int = 5   # turns kept verbatim (each turn = 1 user + 1 assist
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are a helpful, accurate assistant.
+You are a helpful, accurate assistant. always respond short and concise unless the user explicitly asks for a detailed answer.  If you don't know the answer, say you don't know.  Never try to make up an answer.
+
 
 Memory rules (strictly follow):
 1. The RECENT CONVERSATION below is authoritative — trust it over everything else.
