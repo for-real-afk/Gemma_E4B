@@ -50,3 +50,4 @@ tzdata==2026.2
 urllib3==2.6.3
 uvicorn==0.27.0
 watchdog==6.0.0
+python-multipart
