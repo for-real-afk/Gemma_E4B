@@ -126,6 +126,9 @@ if not origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    # Allows any Vercel preview/production URL without manual config updates
+    # e.g. gemma-e4b-abc123-user.vercel.app AND gemma-e4b.vercel.app
+    allow_origin_regex=r"https://[a-zA-Z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
