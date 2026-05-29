@@ -40,7 +40,7 @@ from memory import (
     summarize_in_background,
 )
 from memory.store import delete as delete_session
-from database import init_db, upsert_user, upsert_session, log_query, SessionLocal
+from database import init_db, upsert_user, upsert_session, log_query, save_pdf_chunks, load_pdf_chunks, SessionLocal
 
 
 # ── env ───────────────────────────────────────────────────────────────────────
@@ -318,6 +318,29 @@ def _parse_ollama_response(raw: str) -> dict:
         raise HTTPException(500, "Invalid response from LLM")
 
 
+# ── PDF chunk DB helpers (sync — called via asyncio.to_thread) ───────────────
+
+def _db_save_pdf_chunks(session_id: str, chunks: list[str]) -> None:
+    db = SessionLocal()
+    try:
+        save_pdf_chunks(db, session_id, chunks)
+    except Exception as exc:
+        logger.error("Failed to save PDF chunks to DB: %s", exc)
+    finally:
+        db.close()
+
+
+def _db_load_pdf_chunks(session_id: str) -> list[str] | None:
+    db = SessionLocal()
+    try:
+        return load_pdf_chunks(db, session_id)
+    except Exception as exc:
+        logger.error("Failed to load PDF chunks from DB: %s", exc)
+        return None
+    finally:
+        db.close()
+
+
 # ── analytics background writer ───────────────────────────────────────────────
 
 def _persist_query(
@@ -380,7 +403,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     """
     from memory.tokenizer import TokenCalculator
     from memory.pdf_rag import retrieve_relevant_chunks
-    from memory.embeddings import embed_query
+    from memory.embeddings import embed_query, embed_texts
     from memory.vector_store import get_store
 
     # Re-run RAG for every follow-up question using the stored PDF from this session.
@@ -389,6 +412,24 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     pdf_context   = ""
     tokens_attach = 0
     search_mode   = "none"
+
+    # If this session has no chunks in memory (e.g. server restarted),
+    # try loading them from Supabase and rebuilding the in-memory store.
+    if req.session_id not in _session_pdfs:
+        db_chunks = await asyncio.to_thread(_db_load_pdf_chunks, req.session_id)
+        if db_chunks:
+            _session_pdfs[req.session_id] = db_chunks
+            logger.info(
+                "PDF chunks restored from DB for session %s (%d chunks)",
+                req.session_id, len(db_chunks),
+            )
+            # Re-embed restored chunks so semantic search is available again
+            embeddings = await embed_texts(db_chunks, OLLAMA_HOST, OLLAMA_EMBED_MODEL, OLLAMA_KEY or "")
+            if embeddings:
+                from memory.vector_store import VectorStore, set_store as _set_store
+                store = VectorStore()
+                store.add(db_chunks, embeddings)
+                _set_store(req.session_id, store)
 
     vector_store = get_store(req.session_id)
     if vector_store and vector_store.ready:
@@ -546,8 +587,13 @@ async def chat_file(
                 max_tokens = 3000,
             )
 
-            # Always store raw chunks for keyword fallback
+            # Store in memory for fast access this session
             _session_pdfs[session_id] = chunks
+
+            # Persist to Supabase so chunks survive server restarts / redeploys
+            await asyncio.to_thread(
+                lambda: _db_save_pdf_chunks(session_id, chunks)
+            )
 
             # Try to embed all chunks for semantic search
             from memory.embeddings import embed_texts

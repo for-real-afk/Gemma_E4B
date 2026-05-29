@@ -2,56 +2,47 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class TokenCalculator:
+    """
+    Token counting for cost estimation.
+
+    Primary counts come from Ollama's native prompt_eval_count / eval_count
+    fields — those are exact and require no local tokenizer.
+
+    This class is the fallback only (used when Ollama doesn't return counts,
+    or for attachment text sizing). It loads only tiktoken (instant, no
+    network) and skips HuggingFace downloads entirely — those took 15+
+    HTTP requests on every server restart and are unnecessary now that
+    Ollama provides native counts.
+
+    Fallback chain:
+      GPT-4 model  →  tiktoken cl100k_base  →  char estimate (len // 4)
+      Gemma model  →  char estimate (len // 4)
+    """
+
     def __init__(self):
-        self.gemma_tokenizer = None
         self.tiktoken_encoder = None
-        self.initialized = False
+        self.initialized      = False
 
     def initialize(self) -> None:
-        """Load and cache tokenizers in memory."""
-        # 1. Load tiktoken
+        """Load tiktoken only. Fast, no network calls."""
         try:
             import tiktoken
             self.tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
-            logger.info("tiktoken encoder 'cl100k_base' loaded successfully.")
+            logger.info("tiktoken encoder 'cl100k_base' loaded.")
         except Exception as e:
-            logger.error("Failed to load tiktoken encoder: %s", e)
-
-        # 2. Load AutoTokenizer (transformers)
-        try:
-            from transformers import AutoTokenizer
-            
-            # Try loading alpindale/gemma-tokenizer (public/ungated mirror of gemma)
-            try:
-                self.gemma_tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-tokenizer")
-                logger.info("Gemma AutoTokenizer loaded successfully from 'alpindale/gemma-tokenizer'.")
-            except Exception as e:
-                logger.warning("Failed to load alpindale/gemma-tokenizer: %s. Trying google/gemma-2b...", e)
-                try:
-                    self.gemma_tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b")
-                    logger.info("Gemma AutoTokenizer loaded successfully from 'google/gemma-2b'.")
-                except Exception as e2:
-                    logger.warning("Failed to load google/gemma-2b: %s. Trying gpt2 as fallback...", e2)
-                    try:
-                        self.gemma_tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                        logger.info("AutoTokenizer loaded successfully from 'gpt2' fallback.")
-                    except Exception as e3:
-                        logger.error("Failed to load all tokenizer options: %s", e3)
-        except Exception as e:
-            logger.error("Failed to load transformers AutoTokenizer: %s", e)
-
+            logger.warning("tiktoken unavailable, will use char estimate: %s", e)
         self.initialized = True
+        logger.info("TokenCalculator ready (Ollama native counts are primary).")
 
     @staticmethod
     def route_tokenizer(model: str) -> str:
-        """Map UI model name to internal tokenizer type."""
         if model.lower().strip() in ("gpt4", "gpt-4", "gpt"):
             return "openai"
         return "gemma"
 
     def count_messages_tokens(self, messages: list, model: str) -> int:
-        """Sum token counts across each message's content field."""
         tokenizer_type = self.route_tokenizer(model)
         return sum(
             self.count_tokens(msg.get("content", ""), tokenizer_type)
@@ -60,28 +51,15 @@ class TokenCalculator:
         )
 
     def count_tokens(self, text: str, model_type: str = "gemma") -> int:
-        """Count tokens in text using the requested tokenizer type."""
         if not text:
             return 0
 
-        model_type = model_type.lower()
-        
-        # Tiktoken (OpenAI)
-        if "openai" in model_type or "tiktoken" in model_type or "cl100k" in model_type:
+        if "openai" in model_type.lower():
             if self.tiktoken_encoder:
                 try:
                     return len(self.tiktoken_encoder.encode(text))
-                except Exception as e:
-                    logger.error("Error encoding with tiktoken: %s", e)
-            # Fallback estimation: ~4 chars per token
-            return max(1, len(text) // 4)
+                except Exception:
+                    pass
 
-        # Gemma / HuggingFace AutoTokenizer
-        if self.gemma_tokenizer:
-            try:
-                return len(self.gemma_tokenizer.encode(text))
-            except Exception as e:
-                logger.error("Error encoding with AutoTokenizer: %s", e)
-
-        # General fallback: ~4 characters per token
+        # Gemma or any other model — char estimate
         return max(1, len(text) // 4)

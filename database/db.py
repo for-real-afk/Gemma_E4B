@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import uuid
@@ -86,6 +87,29 @@ def upsert_session(db: Session, session_id: str, user_id: str) -> ChatSession:
         sess.last_active = now
     db.commit()
     return sess
+
+
+def save_pdf_chunks(db: Session, session_id: str, chunks: list[str]) -> None:
+    """Persist PDF text chunks for a session so they survive server restarts."""
+    sess = db.get(ChatSession, session_id)
+    if sess is None:
+        logger.warning("save_pdf_chunks: session %s not found", session_id)
+        return
+    sess.pdf_chunks = json.dumps(chunks)
+    db.commit()
+    logger.info("Saved %d PDF chunks to DB for session %s", len(chunks), session_id)
+
+
+def load_pdf_chunks(db: Session, session_id: str) -> list[str] | None:
+    """Load PDF text chunks from DB. Returns None if none saved."""
+    sess = db.get(ChatSession, session_id)
+    if sess is None or not sess.pdf_chunks:
+        return None
+    try:
+        return json.loads(sess.pdf_chunks)
+    except Exception as e:
+        logger.error("Failed to deserialize pdf_chunks for %s: %s", session_id, e)
+        return None
 
 
 def log_query(

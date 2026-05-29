@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -36,6 +36,9 @@ class ChatSession(Base):
     )
     created_at  = Column(DateTime, nullable=False, default=datetime.utcnow)
     last_active = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # JSON array of text chunks from the last uploaded PDF.
+    # Persisted so follow-up questions survive server restarts.
+    pdf_chunks  = Column(Text, nullable=True)
 
 
 class QueryAnalytic(Base):
