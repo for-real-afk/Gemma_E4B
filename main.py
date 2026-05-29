@@ -416,6 +416,8 @@ async def chat_file(
 
         # ── PDF ───────────────────────────────────────────────────────────────
         elif content_type == "application/pdf":
+            from memory.pdf_rag import chunk_text, retrieve_relevant_chunks
+
             attachment_type = "pdf"
             reader          = PyPDF2.PdfReader(io.BytesIO(file_bytes))
             extracted       = "".join(page.extract_text() or "" for page in reader.pages)
@@ -423,9 +425,21 @@ async def chat_file(
             if not extracted.strip():
                 raise HTTPException(422, "Could not extract text from PDF.")
 
-            attach_text = extracted[:6000]   # track for token counting
+            # Chunk the full PDF and retrieve only the sections most relevant
+            # to the user's query, capped at 3000 tokens of context.
+            chunks      = chunk_text(extracted)
+            attach_text = retrieve_relevant_chunks(
+                chunks,
+                query     = message or extracted[:200],
+                max_tokens = 3000,
+            )
 
-            # Inject PDF text directly into the user message; treat as text turn
+            logger.info(
+                "PDF RAG: %d chunks total, retrieved %d chars (~%d tokens) for query",
+                len(chunks), len(attach_text), len(attach_text) // 4,
+            )
+
+            # Inject retrieved sections into the user message
             combined_message = (
                 f"{message}\n\n[PDF Content]\n{attach_text}".strip()
                 if message.strip()
