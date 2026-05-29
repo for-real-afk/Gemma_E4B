@@ -49,7 +49,7 @@ OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY")
 if not OLLAMA_HOST or not OLLAMA_MODEL:
     raise RuntimeError("Missing OLLAMA_HOST or OLLAMA_MODEL in .env")
 
-MAX_FILE_SIZE_MB = 5
+MAX_FILE_SIZE_MB = 10
 
 
 # ── lifespan (replaces deprecated @app.on_event) ─────────────────────────────
