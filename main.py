@@ -106,13 +106,21 @@ app.add_middleware(
 
 # ── request / response models ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
-    session_id: str   = Field(..., min_length=1, description="Unique conversation ID")
-    message:    str   = Field(..., min_length=1, description="User message text")
+    session_id: str = Field(..., min_length=1, description="Unique conversation ID")
+    message:    str = Field(..., min_length=1, description="User message text")
+    model:      str = Field(default="gemma", description="Tokenizer model: 'gemma' (SentencePiece) or 'gpt4' (BPE)")
+
+
+class Usage(BaseModel):
+    prompt_tokens:     int
+    completion_tokens: int
+    total_tokens:      int
 
 
 class ChatResponse(BaseModel):
     session_id: str
     response:   str
+    usage:      Usage
 
 
 # ── low-level LLM callers ─────────────────────────────────────────────────────
@@ -220,9 +228,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     Flow:
       1. Append user turn → assemble prompt  (sync, instant)
       2. Call LLM with full message history
-      3. Store assistant reply
-      4. Summarize overflow in background    (after response is sent)
+      3. Count tokens via routed tokenizer (gemma→SentencePiece, gpt4→BPE)
+      4. Store assistant reply
+      5. Summarize overflow in background    (after response is sent)
     """
+    from memory.tokenizer import TokenCalculator
+
     messages, overflow, old_summary = add_turn_and_get_prompt(
         session_id   = req.session_id,
         user_message = req.message,
@@ -233,13 +244,25 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     record_assistant_reply(req.session_id, reply)
 
-    # Schedule summarization — runs after HTTP response is delivered
+    calculator        = app.state.token_calculator
+    tokenizer_type    = TokenCalculator.route_tokenizer(req.model)
+    prompt_tokens     = calculator.count_messages_tokens(messages, req.model)
+    completion_tokens = calculator.count_tokens(reply, tokenizer_type)
+
     background_tasks.add_task(
         summarize_in_background,
         req.session_id, overflow, old_summary, call_llm,
     )
 
-    return ChatResponse(session_id=req.session_id, response=reply)
+    return ChatResponse(
+        session_id = req.session_id,
+        response   = reply,
+        usage      = Usage(
+            prompt_tokens     = prompt_tokens,
+            completion_tokens = completion_tokens,
+            total_tokens      = prompt_tokens + completion_tokens,
+        ),
+    )
 
 
 @app.post("/chat-file", response_model=ChatResponse)
@@ -247,6 +270,7 @@ async def chat_file(
     background_tasks: BackgroundTasks,
     session_id: str        = Form(...),
     message:    str        = Form(""),
+    model:      str        = Form("gemma"),
     file:       UploadFile = File(...),
 ):
     """
@@ -336,13 +360,26 @@ async def chat_file(
 
     record_assistant_reply(session_id, reply)
 
-    # Schedule summarization — runs after HTTP response is delivered
+    from memory.tokenizer import TokenCalculator
+    calculator        = app.state.token_calculator
+    tokenizer_type    = TokenCalculator.route_tokenizer(model)
+    prompt_tokens     = calculator.count_messages_tokens(messages, model)
+    completion_tokens = calculator.count_tokens(reply, tokenizer_type)
+
     background_tasks.add_task(
         summarize_in_background,
         session_id, overflow, old_summary, call_llm,
     )
 
-    return ChatResponse(session_id=session_id, response=reply)
+    return ChatResponse(
+        session_id = session_id,
+        response   = reply,
+        usage      = Usage(
+            prompt_tokens     = prompt_tokens,
+            completion_tokens = completion_tokens,
+            total_tokens      = prompt_tokens + completion_tokens,
+        ),
+    )
 
 
 # ── session management endpoints ──────────────────────────────────────────────
@@ -374,14 +411,17 @@ def health():
 @app.post("/tokenize/count", summary="Count tokens in a text block")
 def count_tokens(text: str, model_type: str = "gemma"):
     """
-    Count tokens using the globally cached TokenCalculator.
-    `model_type` options: 'gemma' (AutoTokenizer) or 'openai' (tiktoken)
+    Utility endpoint — count tokens using the globally cached TokenCalculator.
+    `model_type` accepts UI values ('gemma', 'gpt4') or internal aliases ('openai', 'tiktoken').
     """
+    from memory.tokenizer import TokenCalculator
+
     if not hasattr(app.state, "token_calculator"):
         raise HTTPException(status_code=503, detail="TokenCalculator not initialized yet")
-    
-    count = app.state.token_calculator.count_tokens(text, model_type)
-    return {"token_count": count, "model_type": model_type}
+
+    routed = TokenCalculator.route_tokenizer(model_type)
+    count  = app.state.token_calculator.count_tokens(text, routed)
+    return {"token_count": count, "model_type": model_type, "tokenizer": routed}
 
 
 @app.get("/")

@@ -43,6 +43,22 @@ class TokenCalculator:
 
         self.initialized = True
 
+    @staticmethod
+    def route_tokenizer(model: str) -> str:
+        """Map UI model name to internal tokenizer type."""
+        if model.lower().strip() in ("gpt4", "gpt-4", "gpt"):
+            return "openai"
+        return "gemma"
+
+    def count_messages_tokens(self, messages: list, model: str) -> int:
+        """Sum token counts across each message's content field."""
+        tokenizer_type = self.route_tokenizer(model)
+        return sum(
+            self.count_tokens(msg.get("content", ""), tokenizer_type)
+            for msg in messages
+            if msg.get("content")
+        )
+
     def count_tokens(self, text: str, model_type: str = "gemma") -> int:
         """Count tokens in text using the requested tokenizer type."""
         if not text:
