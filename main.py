@@ -170,11 +170,12 @@ class Cost(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    session_id: str
-    response:   str
-    usage:      Usage
-    latency_ms: float
-    cost:       Cost
+    session_id:  str
+    response:    str
+    usage:       Usage
+    latency_ms:  float
+    cost:        Cost
+    search_mode: str = "none"   # "semantic" | "keyword" | "none"
 
 
 # ── low-level LLM callers ─────────────────────────────────────────────────────
@@ -387,24 +388,31 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # are not available (nomic-embed-text not pulled on Ollama server).
     pdf_context   = ""
     tokens_attach = 0
+    search_mode   = "none"
 
     vector_store = get_store(req.session_id)
     if vector_store and vector_store.ready:
-        # Semantic search path
         q_embedding = await embed_query(req.message, OLLAMA_HOST, OLLAMA_EMBED_MODEL, OLLAMA_KEY or "")
         if q_embedding:
             pdf_context = vector_store.search(q_embedding, max_tokens=2000)
-        else:
-            # Embed query failed — fall through to keyword
-            pass
+            search_mode = "semantic"
 
     if not pdf_context and req.session_id in _session_pdfs:
-        # Keyword fallback
         pdf_context = retrieve_relevant_chunks(
             _session_pdfs[req.session_id],
             query      = req.message,
             max_tokens = 2000,
         )
+        if pdf_context:
+            search_mode = "keyword"
+
+    if search_mode != "none":
+        logger.info(
+            "[PDF RAG] session=%s  mode=%-8s  context=%d chars (~%d tokens)",
+            req.session_id, search_mode, len(pdf_context), len(pdf_context) // 4,
+        )
+    else:
+        logger.debug("[PDF RAG] session=%s  no PDF in session", req.session_id)
 
     user_message = (
         f"{req.message}\n\n[PDF Context from uploaded document]\n{pdf_context}"
@@ -447,10 +455,11 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     )
 
     return ChatResponse(
-        session_id = req.session_id,
-        response   = reply,
-        latency_ms = round(latency_ms, 2),
-        usage      = Usage(
+        session_id  = req.session_id,
+        response    = reply,
+        latency_ms  = round(latency_ms, 2),
+        search_mode = search_mode,
+        usage       = Usage(
             prompt_tokens     = prompt_tokens,
             completion_tokens = completion_tokens,
             total_tokens      = prompt_tokens + completion_tokens,
@@ -624,10 +633,11 @@ async def chat_file(
     )
 
     return ChatResponse(
-        session_id = session_id,
-        response   = reply,
-        latency_ms = round(latency_ms, 2),
-        usage      = Usage(
+        session_id  = session_id,
+        response    = reply,
+        latency_ms  = round(latency_ms, 2),
+        search_mode = "keyword",   # first upload always uses retrieved text directly
+        usage       = Usage(
             prompt_tokens     = prompt_tokens,
             completion_tokens = completion_tokens,
             total_tokens      = prompt_tokens + completion_tokens,
