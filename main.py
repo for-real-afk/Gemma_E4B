@@ -163,7 +163,7 @@ async def _call_ollama(payload: dict) -> tuple[dict, float]:
             r = await client.post(
                 f"{OLLAMA_HOST}/api/chat",
                 json=payload,
-                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
+                headers={"Authorization": f"Bearer {OLLAMA_KEY}"} if OLLAMA_KEY else {},
             )
         except Exception as e:
             raise HTTPException(502, f"LLM connection failed: {e}")
