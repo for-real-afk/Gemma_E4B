@@ -320,16 +320,6 @@ def _parse_ollama_response(raw: str) -> dict:
 
 # ── PDF chunk DB helpers (sync — called via asyncio.to_thread) ───────────────
 
-def _db_save_pdf_chunks(session_id: str, chunks: list[str]) -> None:
-    db = SessionLocal()
-    try:
-        save_pdf_chunks(db, session_id, chunks)
-    except Exception as exc:
-        logger.error("Failed to save PDF chunks to DB: %s", exc)
-    finally:
-        db.close()
-
-
 def _db_load_pdf_chunks(session_id: str) -> list[str] | None:
     db = SessionLocal()
     try:
@@ -356,15 +346,22 @@ def _persist_query(
     query_text:      str | None,
     has_attachment:  bool,
     attachment_type: str | None,
+    pdf_chunks:      list[str] | None = None,
 ) -> None:
     """
     Sync DB writer — FastAPI runs sync background tasks in a thread pool,
     so this never blocks the event loop.
+
+    pdf_chunks is saved AFTER upsert_session so the session row exists.
+    This is the correct order — attempting to save chunks before the
+    session row is created causes a foreign-key/not-found error.
     """
     db = SessionLocal()
     try:
         upsert_user(db, user_id)
         upsert_session(db, session_id, user_id)
+        if pdf_chunks:
+            save_pdf_chunks(db, session_id, pdf_chunks)
         log_query(
             db,
             session_id      = session_id,
@@ -589,11 +586,7 @@ async def chat_file(
 
             # Store in memory for fast access this session
             _session_pdfs[session_id] = chunks
-
-            # Persist to Supabase so chunks survive server restarts / redeploys
-            await asyncio.to_thread(
-                lambda: _db_save_pdf_chunks(session_id, chunks)
-            )
+            # chunks are saved to DB inside _persist_query (after upsert_session)
 
             # Try to embed all chunks for semantic search
             from memory.embeddings import embed_texts
@@ -676,6 +669,7 @@ async def chat_file(
         prompt_tokens, completion_tokens, tokens_attach,
         latency_ms, cost["usd"], cost["inr"],
         message[:500], True, attachment_type,
+        _session_pdfs.get(session_id),   # saved to DB after upsert_session
     )
 
     return ChatResponse(
