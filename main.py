@@ -63,6 +63,22 @@ async def lifespan(app: FastAPI):
 
 # ── app ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Gemma4 Chat Service", version="3.0.0", lifespan=lifespan)
+UPLOAD_FOLDER = "uploads"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
+
+    return {
+        "message": "File uploaded successfully",
+        "filename": file.filename,
+        "path": file_path
+    }
 
 origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 if not origins:
@@ -346,7 +362,22 @@ def health():
 def root():
     return {"service": "Gemma4 Chat Service", "version": "3.0.0", "docs": "/docs"}
 
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    
+    upload_folder = "uploads"
+    os.makedirs(upload_folder, exist_ok=True)
 
+    file_path = os.path.join(upload_folder, file.filename)
+
+    with open(file_path, "wb") as buffer:
+        buffer.write(await file.read())
+
+    return {
+        "message": "File uploaded successfully",
+        "filename": file.filename,
+        "path": file_path
+    }
 # ── entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
