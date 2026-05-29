@@ -51,6 +51,10 @@ OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY")
 if not OLLAMA_HOST or not OLLAMA_MODEL:
     raise RuntimeError("Missing OLLAMA_HOST or OLLAMA_MODEL in .env")
 
+# OpenAI — optional. Required only when the frontend selects the gpt4 model.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override with gpt-4o, gpt-4, etc.
+
 MAX_FILE_SIZE_MB = 3
 
 # ── pricing ───────────────────────────────────────────────────────────────────
@@ -231,6 +235,58 @@ async def call_llm_with_image(prompt: str, image_b64: str) -> tuple[dict, float]
     })
 
 
+async def call_openai_with_messages(messages: list[dict]) -> tuple[dict, float]:
+    """
+    OpenAI Chat Completions API call.
+    Returns ({"response", "prompt_tokens", "completion_tokens"}, latency_ms).
+    Raises 503 if OPENAI_API_KEY is not set.
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            503,
+            "OpenAI API key not configured. Set OPENAI_API_KEY in your environment variables.",
+        )
+
+    t0 = time.perf_counter()
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                json={"model": OPENAI_MODEL, "messages": messages},
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type":  "application/json",
+                },
+            )
+        except Exception as e:
+            raise HTTPException(502, f"OpenAI connection failed: {e}")
+
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"OpenAI error: {r.text}")
+
+    data    = r.json()
+    content = data["choices"][0]["message"]["content"]
+    usage   = data.get("usage", {})
+
+    logger.info(
+        "OpenAI latency=%.0f ms  model=%s  tokens=%d+%d",
+        latency_ms, OPENAI_MODEL,
+        usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+    )
+
+    return {
+        "response":          content,
+        "prompt_tokens":     usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+    }, latency_ms
+
+
+def _is_openai_model(model: str) -> bool:
+    return model.lower().strip() in ("gpt4", "gpt-4", "gpt")
+
+
 def _parse_ollama_response(raw: str) -> dict:
     try:
         lines  = [l for l in raw.strip().splitlines() if l.strip()]
@@ -317,8 +373,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         user_message = req.message,
     )
 
-    result, latency_ms = await call_llm_with_messages(messages)
-    reply              = result["response"]
+    if _is_openai_model(req.model):
+        result, latency_ms = await call_openai_with_messages(messages)
+    else:
+        result, latency_ms = await call_llm_with_messages(messages)
+
+    reply = result["response"]
 
     record_assistant_reply(req.session_id, reply)
 
@@ -451,8 +511,11 @@ async def chat_file(
                 user_message = combined_message,
             )
 
-            result, latency_ms = await call_llm_with_messages(messages)
-            reply               = result["response"]
+            if _is_openai_model(model):
+                result, latency_ms = await call_openai_with_messages(messages)
+            else:
+                result, latency_ms = await call_llm_with_messages(messages)
+            reply = result["response"]
 
         # ── AUDIO ─────────────────────────────────────────────────────────────
         elif content_type.startswith("audio"):

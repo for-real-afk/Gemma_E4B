@@ -29,6 +29,14 @@ services:
       - key: ALLOWED_ORIGINS
         sync: false
 
+      # OpenAI — optional. Required only when GPT-4 is selected in the UI.
+      - key: OPENAI_API_KEY
+        sync: false
+
+      # OpenAI model to use (default: gpt-4o-mini)
+      - key: OPENAI_MODEL
+        value: "gpt-4o-mini"
+
       # ── Optional — safe to commit defaults ───────────────────────────────
       - key: USD_TO_INR
         value: "85.0"
