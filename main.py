@@ -12,6 +12,7 @@ Changes from v2.2.0:
 
 import logging
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,6 +40,7 @@ from memory import (
     summarize_in_background,
 )
 from memory.store import delete as delete_session
+from database import init_db, upsert_user, upsert_session, log_query, SessionLocal
 
 
 # ── env ───────────────────────────────────────────────────────────────────────
@@ -51,11 +53,28 @@ if not OLLAMA_HOST or not OLLAMA_MODEL:
 
 MAX_FILE_SIZE_MB = 10
 
+# ── pricing ───────────────────────────────────────────────────────────────────
+USD_TO_INR = float(os.getenv("USD_TO_INR", "85.0"))
+
+_MODEL_PRICING: dict[str, dict[str, float]] = {
+    "gemma": {"input": 0.10 / 1_000_000, "output": 0.40 / 1_000_000},
+    "gpt4":  {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+}
+
+
+def compute_cost(prompt_tokens: int, completion_tokens: int, model: str) -> dict[str, float]:
+    pricing = _MODEL_PRICING.get(model.lower(), _MODEL_PRICING["gemma"])
+    usd = prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]
+    return {"usd": round(usd, 8), "inr": round(usd * USD_TO_INR, 6)}
+
 
 # ── lifespan (replaces deprecated @app.on_event) ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background pruner on startup; initialize tokenizers; cancel cleanly on shutdown."""
+    await asyncio.to_thread(init_db)
+    logger.info("Database initialised.")
+
     pruner = asyncio.create_task(prune_stale_sessions())
     logger.info("Session pruner started.")
     
@@ -107,6 +126,7 @@ app.add_middleware(
 # ── request / response models ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1, description="Unique conversation ID")
+    user_id:    str = Field(default="anonymous", description="Persistent anonymous user ID from localStorage")
     message:    str = Field(..., min_length=1, description="User message text")
     model:      str = Field(default="gemma", description="Tokenizer model: 'gemma' (SentencePiece) or 'gpt4' (BPE)")
 
@@ -117,95 +137,86 @@ class Usage(BaseModel):
     total_tokens:      int
 
 
+class Cost(BaseModel):
+    usd: float
+    inr: float
+
+
 class ChatResponse(BaseModel):
     session_id: str
     response:   str
     usage:      Usage
+    latency_ms: float
+    cost:       Cost
 
 
 # ── low-level LLM callers ─────────────────────────────────────────────────────
 
+async def _call_ollama(payload: dict) -> tuple[dict, float]:
+    """
+    Internal: POST payload to Ollama, measure wall-clock latency, log it.
+    Returns (parsed_result, latency_ms).
+    """
+    t0 = time.perf_counter()
+    async with httpx.AsyncClient(timeout=120) as client:
+        try:
+            r = await client.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json=payload,
+                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
+            )
+        except Exception as e:
+            raise HTTPException(502, f"LLM connection failed: {e}")
+
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, r.text)
+
+    latency_ms = (time.perf_counter() - t0) * 1000
+    logger.info("LLM latency=%.0f ms  model=%s", latency_ms, payload.get("model", "?"))
+    return _parse_ollama_response(r.text), latency_ms
+
+
 async def call_llm(prompt: str) -> dict:
     """
-    Text-only call (used by the summarizer and plain /chat fallback path).
-    Returns {"response": "<text>"}.
+    Text-only call used by the summarizer (background task).
+    Signature must stay (str) -> dict — latency is discarded here.
     """
-    async with httpx.AsyncClient(timeout=120) as client:
-        try:
-            r = await client.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model":    OLLAMA_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream":   False,
-                },
-                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
-            )
-        except Exception as e:
-            raise HTTPException(502, f"LLM connection failed: {e}")
-
-        if r.status_code != 200:
-            raise HTTPException(r.status_code, r.text)
-
-        return _parse_ollama_response(r.text)
+    result, _ = await _call_ollama({
+        "model":    OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream":   False,
+    })
+    return result
 
 
-async def call_llm_with_messages(messages: list[dict]) -> dict:
+async def call_llm_with_messages(messages: list[dict]) -> tuple[dict, float]:
     """
-    Multi-turn call — accepts the full assembled message list from the memory manager.
-    This is the primary path for all memory-aware requests.
-    Returns {"response": "<text>"}.
+    Multi-turn call — primary path for all memory-aware requests.
+    Returns ({"response": "<text>"}, latency_ms).
     """
-    async with httpx.AsyncClient(timeout=120) as client:
-        try:
-            r = await client.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model":    OLLAMA_MODEL,
-                    "messages": messages,
-                    "stream":   False,
-                },
-                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
-            )
-        except Exception as e:
-            raise HTTPException(502, f"LLM connection failed: {e}")
-
-        if r.status_code != 200:
-            raise HTTPException(r.status_code, r.text)
-
-        return _parse_ollama_response(r.text)
+    return await _call_ollama({
+        "model":    OLLAMA_MODEL,
+        "messages": messages,
+        "stream":   False,
+    })
 
 
-async def call_llm_with_image(prompt: str, image_b64: str) -> dict:
+async def call_llm_with_image(prompt: str, image_b64: str) -> tuple[dict, float]:
     """
-    Vision call — used ONCE per image to extract text semantics.
-    The raw image is never stored; only the returned description enters memory.
-    Returns {"response": "<text>"}.
+    Vision call — one-shot image-to-text semantics extraction.
+    Returns ({"response": "<text>"}, latency_ms).
     """
-    async with httpx.AsyncClient(timeout=120) as client:
-        try:
-            r = await client.post(
-                f"{OLLAMA_HOST}/api/chat",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "messages": [
-                        {
-                            "role":    "user",
-                            "content": prompt,
-                            "images":  [image_b64],   # base64, no data URI prefix
-                        }
-                    ],
-                    "stream": False,
-                },
-                headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
-            )
-        except Exception as e:
-            raise HTTPException(502, f"LLM connection failed: {e}")
-
-        if r.status_code != 200:
-            raise HTTPException(r.status_code, r.text)
-
-        return _parse_ollama_response(r.text)
+    return await _call_ollama({
+        "model":    OLLAMA_MODEL,
+        "messages": [
+            {
+                "role":    "user",
+                "content": prompt,
+                "images":  [image_b64],   # base64, no data URI prefix
+            }
+        ],
+        "stream": False,
+    })
 
 
 def _parse_ollama_response(raw: str) -> dict:
@@ -216,6 +227,52 @@ def _parse_ollama_response(raw: str) -> dict:
         return {"response": content}
     except Exception:
         raise HTTPException(500, "Invalid response from LLM")
+
+
+# ── analytics background writer ───────────────────────────────────────────────
+
+def _persist_query(
+    user_id:         str,
+    session_id:      str,
+    model_used:      str,
+    tokens_in:       int,
+    tokens_out:      int,
+    tokens_attach:   int,
+    latency_ms:      float,
+    cost_usd:        float,
+    cost_inr:        float,
+    query_text:      str | None,
+    has_attachment:  bool,
+    attachment_type: str | None,
+) -> None:
+    """
+    Sync DB writer — FastAPI runs sync background tasks in a thread pool,
+    so this never blocks the event loop.
+    """
+    db = SessionLocal()
+    try:
+        upsert_user(db, user_id)
+        upsert_session(db, session_id, user_id)
+        log_query(
+            db,
+            session_id      = session_id,
+            user_id         = user_id,
+            model_used      = model_used,
+            tokens_in       = tokens_in,
+            tokens_out      = tokens_out,
+            tokens_attach   = tokens_attach,
+            latency_ms      = latency_ms,
+            cost_usd        = cost_usd,
+            cost_inr        = cost_inr,
+            query_text      = query_text,
+            has_attachment  = has_attachment,
+            attachment_type = attachment_type,
+        )
+    except Exception as exc:
+        logger.error("DB persist_query failed: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
@@ -239,8 +296,8 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         user_message = req.message,
     )
 
-    result = await call_llm_with_messages(messages)
-    reply  = result["response"]
+    result, latency_ms = await call_llm_with_messages(messages)
+    reply              = result["response"]
 
     record_assistant_reply(req.session_id, reply)
 
@@ -249,19 +306,30 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     prompt_tokens     = calculator.count_messages_tokens(messages, req.model)
     completion_tokens = calculator.count_tokens(reply, tokenizer_type)
 
+    cost = compute_cost(prompt_tokens, completion_tokens, req.model)
+
     background_tasks.add_task(
         summarize_in_background,
         req.session_id, overflow, old_summary, call_llm,
+    )
+    background_tasks.add_task(
+        _persist_query,
+        req.user_id, req.session_id, req.model,
+        prompt_tokens, completion_tokens, 0,
+        latency_ms, cost["usd"], cost["inr"],
+        req.message[:500], False, None,
     )
 
     return ChatResponse(
         session_id = req.session_id,
         response   = reply,
+        latency_ms = round(latency_ms, 2),
         usage      = Usage(
             prompt_tokens     = prompt_tokens,
             completion_tokens = completion_tokens,
             total_tokens      = prompt_tokens + completion_tokens,
         ),
+        cost = Cost(**cost),
     )
 
 
@@ -269,6 +337,7 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 async def chat_file(
     background_tasks: BackgroundTasks,
     session_id: str        = Form(...),
+    user_id:    str        = Form("anonymous"),
     message:    str        = Form(""),
     model:      str        = Form("gemma"),
     file:       UploadFile = File(...),
@@ -289,10 +358,15 @@ async def chat_file(
 
     content_type = file.content_type or ""
 
+    latency_ms      = 0.0
+    attach_text     = ""
+    attachment_type = None
+
     try:
         # ── IMAGE ─────────────────────────────────────────────────────────────
         if content_type.startswith("image"):
-            image_b64 = base64.b64encode(file_bytes).decode("utf-8")
+            image_b64       = base64.b64encode(file_bytes).decode("utf-8")
+            attachment_type = "image"
 
             # Step 1: one-shot vision pass to extract semantics
             vision_prompt = (
@@ -300,8 +374,9 @@ async def chat_file(
                 or "Describe this image in detail, capturing all key facts, "
                    "decisions, and structural information."
             )
-            vision_result = await call_llm_with_image(vision_prompt, image_b64)
-            description   = vision_result["response"]
+            vision_result, _ = await call_llm_with_image(vision_prompt, image_b64)
+            description       = vision_result["response"]
+            attach_text       = description   # track for token counting
 
             # Step 2: store description as media_description (image itself is discarded)
             #   ❌  "User shared an image"
@@ -313,22 +388,25 @@ async def chat_file(
             )
 
             # Step 3: get conversational reply using the full memory context
-            result = await call_llm_with_messages(messages)
-            reply  = result["response"]
+            result, latency_ms = await call_llm_with_messages(messages)
+            reply               = result["response"]
 
         # ── PDF ───────────────────────────────────────────────────────────────
         elif content_type == "application/pdf":
-            reader    = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-            extracted = "".join(page.extract_text() or "" for page in reader.pages)
+            attachment_type = "pdf"
+            reader          = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            extracted       = "".join(page.extract_text() or "" for page in reader.pages)
 
             if not extracted.strip():
                 raise HTTPException(422, "Could not extract text from PDF.")
 
+            attach_text = extracted[:6000]   # track for token counting
+
             # Inject PDF text directly into the user message; treat as text turn
             combined_message = (
-                f"{message}\n\n[PDF Content]\n{extracted[:6000]}".strip()
+                f"{message}\n\n[PDF Content]\n{attach_text}".strip()
                 if message.strip()
-                else f"[PDF Content]\n{extracted[:6000]}"
+                else f"[PDF Content]\n{attach_text}"
             )
 
             messages, overflow, old_summary = add_turn_and_get_prompt(
@@ -336,8 +414,8 @@ async def chat_file(
                 user_message = combined_message,
             )
 
-            result = await call_llm_with_messages(messages)
-            reply  = result["response"]
+            result, latency_ms = await call_llm_with_messages(messages)
+            reply               = result["response"]
 
         # ── AUDIO ─────────────────────────────────────────────────────────────
         elif content_type.startswith("audio"):
@@ -365,20 +443,31 @@ async def chat_file(
     tokenizer_type    = TokenCalculator.route_tokenizer(model)
     prompt_tokens     = calculator.count_messages_tokens(messages, model)
     completion_tokens = calculator.count_tokens(reply, tokenizer_type)
+    tokens_attach     = calculator.count_tokens(attach_text, tokenizer_type) if attach_text else 0
+    cost              = compute_cost(prompt_tokens, completion_tokens, model)
 
     background_tasks.add_task(
         summarize_in_background,
         session_id, overflow, old_summary, call_llm,
     )
+    background_tasks.add_task(
+        _persist_query,
+        user_id, session_id, model,
+        prompt_tokens, completion_tokens, tokens_attach,
+        latency_ms, cost["usd"], cost["inr"],
+        message[:500], True, attachment_type,
+    )
 
     return ChatResponse(
         session_id = session_id,
         response   = reply,
+        latency_ms = round(latency_ms, 2),
         usage      = Usage(
             prompt_tokens     = prompt_tokens,
             completion_tokens = completion_tokens,
             total_tokens      = prompt_tokens + completion_tokens,
         ),
+        cost = Cost(**cost),
     )
 
 
