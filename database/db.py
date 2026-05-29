@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from datetime import datetime
 
@@ -9,21 +10,41 @@ from .models import Base, UserProfile, ChatSession, QueryAnalytic
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = "sqlite:///./gemma_chat.db"
+# ── connection setup ──────────────────────────────────────────────────────────
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},  # required for SQLite + multi-thread
-    pool_pre_ping=True,
-)
+_raw_url = os.getenv("DATABASE_URL", "sqlite:///./gemma_chat.db")
+
+# Supabase (and some other providers) return "postgres://" which SQLAlchemy 2.0
+# no longer accepts — it requires "postgresql://"
+DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1) if _raw_url.startswith("postgres://") else _raw_url
+
+_is_sqlite = DATABASE_URL.startswith("sqlite")
+
+if _is_sqlite:
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False},  # SQLite + multi-thread safety
+        pool_pre_ping=True,
+    )
+else:
+    # PostgreSQL / Supabase
+    # pool_size + max_overflow kept modest for Supabase free tier (max 60 direct connections)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,   # recycles stale connections transparently
+        pool_size=5,
+        max_overflow=10,
+    )
+    logger.info("Using PostgreSQL backend: %s", DATABASE_URL.split("@")[-1])  # log host only, not password
 
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 
 def init_db() -> None:
-    """Create all tables if they don't exist yet.  Safe to call on every startup."""
+    """Create all tables if they don't exist yet. Safe to call on every startup."""
     Base.metadata.create_all(engine)
-    logger.info("Database tables ready.")
+    backend = "SQLite" if _is_sqlite else "PostgreSQL"
+    logger.info("Database tables ready (%s).", backend)
 
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────

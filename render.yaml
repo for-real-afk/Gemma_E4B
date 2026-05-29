@@ -10,6 +10,12 @@ services:
 
     envVars:
       # ── Required — set these in the Render dashboard (never commit values) ──
+      # Supabase PostgreSQL connection string — paste from Supabase dashboard
+      # Project Settings → Database → URI  (Transaction Pooler, port 6543)
+      # Leave unset to fall back to local SQLite (not recommended on Render)
+      - key: DATABASE_URL
+        sync: false
+
       - key: OLLAMA_HOST
         sync: false
 

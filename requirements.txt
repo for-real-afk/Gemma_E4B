@@ -57,3 +57,4 @@ sentencepiece>=0.1.99
 
 python-multipart
 sqlalchemy>=2.0
+psycopg2-binary>=2.9
