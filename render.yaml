@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: gemma-e4b-api
+    runtime: python
+    region: singapore          # closest Render region to the Ollama host (Mumbai)
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      # ── Required — set these in the Render dashboard (never commit values) ──
+      - key: OLLAMA_HOST
+        sync: false
+
+      - key: OLLAMA_MODEL
+        sync: false
+
+      - key: OLLAMA_API_KEY
+        sync: false
+
+      # Frontend origin(s) allowed by CORS  e.g. https://gemma-e4b.vercel.app
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+      # ── Optional — safe to commit defaults ───────────────────────────────
+      - key: USD_TO_INR
+        value: "85.0"
+
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+
+      - key: CACHE_TYPE
+        value: "in_memory"
