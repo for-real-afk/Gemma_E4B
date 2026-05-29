@@ -71,23 +71,32 @@ def compute_cost(prompt_tokens: int, completion_tokens: int, model: str) -> dict
 # ── lifespan (replaces deprecated @app.on_event) ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start background pruner on startup; initialize tokenizers; cancel cleanly on shutdown."""
+    # 1. DB — fast, must complete before serving
     await asyncio.to_thread(init_db)
     logger.info("Database initialised.")
 
+    # 2. Session pruner
     pruner = asyncio.create_task(prune_stale_sessions())
     logger.info("Session pruner started.")
-    
-    # Initialize and cache TokenCalculator globally in app.state
+
+    # 3. TokenCalculator — place the instance immediately so requests never
+    #    hit an AttributeError, then load tokenizers in the background.
+    #    Primary token counts come from Ollama's response fields; the
+    #    tokenizer is only a fallback, so a short warm-up delay is fine.
     from memory.tokenizer import TokenCalculator
     calculator = TokenCalculator()
-    logger.info("Initializing TokenCalculator (loading/caching tokenizers)...")
-    await asyncio.to_thread(calculator.initialize)
     app.state.token_calculator = calculator
-    logger.info("TokenCalculator initialization complete.")
-    
+    tokenizer_task = asyncio.create_task(asyncio.to_thread(calculator.initialize))
+    tokenizer_task.add_done_callback(
+        lambda t: logger.info("TokenCalculator ready.") if not t.exception()
+                  else logger.warning("TokenCalculator init failed (char-estimate fallback active): %s", t.exception())
+    )
+    logger.info("TokenCalculator initializing in background — server starting now.")
+
     yield
+
     pruner.cancel()
+    tokenizer_task.cancel()
     logger.info("Session pruner stopped.")
 
 
