@@ -51,7 +51,7 @@ OLLAMA_KEY   = os.getenv("OLLAMA_API_KEY")
 if not OLLAMA_HOST or not OLLAMA_MODEL:
     raise RuntimeError("Missing OLLAMA_HOST or OLLAMA_MODEL in .env")
 
-MAX_FILE_SIZE_MB = 10
+MAX_FILE_SIZE_MB = 3
 
 # ── pricing ───────────────────────────────────────────────────────────────────
 USD_TO_INR = float(os.getenv("USD_TO_INR", "85.0"))
