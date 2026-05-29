@@ -55,3 +55,4 @@ transformers>=4.38.0
 tiktoken>=0.6.0
 sentencepiece>=0.1.99
 
+python-multipart
