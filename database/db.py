@@ -4,7 +4,7 @@ import os
 import uuid
 from datetime import datetime
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 
 from .models import Base, UserProfile, ChatSession, QueryAnalytic
@@ -44,8 +44,33 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 def init_db() -> None:
     """Create all tables if they don't exist yet. Safe to call on every startup."""
     Base.metadata.create_all(engine)
+    _run_migrations()
     backend = "SQLite" if _is_sqlite else "PostgreSQL"
     logger.info("Database tables ready (%s).", backend)
+
+
+def _run_migrations() -> None:
+    """
+    Apply additive schema changes that create_all() won't handle on existing tables.
+    Each migration is idempotent — safe to run on every startup.
+    """
+    try:
+        with engine.connect() as conn:
+            if _is_sqlite:
+                # SQLite: check PRAGMA, add only if missing
+                existing = {r[1] for r in conn.execute(text("PRAGMA table_info(chat_sessions)"))}
+                if "pdf_chunks" not in existing:
+                    conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN pdf_chunks TEXT"))
+                    conn.commit()
+                    logger.info("Migration: added pdf_chunks column (SQLite).")
+            else:
+                # PostgreSQL: IF NOT EXISTS handles idempotency natively
+                conn.execute(text(
+                    "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS pdf_chunks TEXT"
+                ))
+                conn.commit()
+    except Exception as exc:
+        logger.warning("Migration skipped (non-fatal): %s", exc)
 
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────
