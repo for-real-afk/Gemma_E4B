@@ -221,10 +221,19 @@ async def call_llm_with_image(prompt: str, image_b64: str) -> tuple[dict, float]
 
 def _parse_ollama_response(raw: str) -> dict:
     try:
-        lines   = [l for l in raw.strip().splitlines() if l.strip()]
-        parsed  = [json.loads(l) for l in lines]
+        lines  = [l for l in raw.strip().splitlines() if l.strip()]
+        parsed = [json.loads(l) for l in lines]
         content = "".join(p.get("message", {}).get("content", "") for p in parsed)
-        return {"response": content}
+
+        # Ollama returns actual model token counts in the final response object.
+        # These are exact Gemma SentencePiece counts — more accurate than any
+        # external tokenizer fallback.
+        final = parsed[-1] if parsed else {}
+        return {
+            "response":          content,
+            "prompt_tokens":     final.get("prompt_eval_count"),  # int | None
+            "completion_tokens": final.get("eval_count"),         # int | None
+        }
     except Exception:
         raise HTTPException(500, "Invalid response from LLM")
 
@@ -301,10 +310,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     record_assistant_reply(req.session_id, reply)
 
+    # Prefer Ollama's native counts (exact Gemma tokenization).
+    # Fall back to our cached tokenizer only when Ollama doesn't return them.
     calculator        = app.state.token_calculator
     tokenizer_type    = TokenCalculator.route_tokenizer(req.model)
-    prompt_tokens     = calculator.count_messages_tokens(messages, req.model)
-    completion_tokens = calculator.count_tokens(reply, tokenizer_type)
+    prompt_tokens     = result.get("prompt_tokens")     or calculator.count_messages_tokens(messages, req.model)
+    completion_tokens = result.get("completion_tokens") or calculator.count_tokens(reply, tokenizer_type)
 
     cost = compute_cost(prompt_tokens, completion_tokens, req.model)
 
@@ -441,8 +452,8 @@ async def chat_file(
     from memory.tokenizer import TokenCalculator
     calculator        = app.state.token_calculator
     tokenizer_type    = TokenCalculator.route_tokenizer(model)
-    prompt_tokens     = calculator.count_messages_tokens(messages, model)
-    completion_tokens = calculator.count_tokens(reply, tokenizer_type)
+    prompt_tokens     = result.get("prompt_tokens")     or calculator.count_messages_tokens(messages, model)
+    completion_tokens = result.get("completion_tokens") or calculator.count_tokens(reply, tokenizer_type)
     tokens_attach     = calculator.count_tokens(attach_text, tokenizer_type) if attach_text else 0
     cost              = compute_cost(prompt_tokens, completion_tokens, model)
 
