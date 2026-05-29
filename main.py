@@ -10,17 +10,22 @@ Changes from v2.2.0:
   - /session/{session_id}/stats   endpoint for debugging
 """
 
+import logging
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from contextlib import asynccontextmanager
 import asyncio
 import base64
 import io
 import json
-import logging
-import os
 
 import httpx
 import PyPDF2
-from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -35,9 +40,6 @@ from memory import (
 )
 from memory.store import delete as delete_session
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # ── env ───────────────────────────────────────────────────────────────────────
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST")
@@ -53,9 +55,18 @@ MAX_FILE_SIZE_MB = 5
 # ── lifespan (replaces deprecated @app.on_event) ─────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start background pruner on startup; cancel cleanly on shutdown."""
+    """Start background pruner on startup; initialize tokenizers; cancel cleanly on shutdown."""
     pruner = asyncio.create_task(prune_stale_sessions())
     logger.info("Session pruner started.")
+    
+    # Initialize and cache TokenCalculator globally in app.state
+    from memory.tokenizer import TokenCalculator
+    calculator = TokenCalculator()
+    logger.info("Initializing TokenCalculator (loading/caching tokenizers)...")
+    await asyncio.to_thread(calculator.initialize)
+    app.state.token_calculator = calculator
+    logger.info("TokenCalculator initialization complete.")
+    
     yield
     pruner.cancel()
     logger.info("Session pruner stopped.")
@@ -351,11 +362,26 @@ def session_stats(session_id: str):
 
 @app.get("/health")
 def health():
+    from memory.store import CACHE_TYPE
     return {
         "status":           "ok",
         "model":            OLLAMA_MODEL,
         "active_sessions":  active_session_count(),
+        "cache_type":       CACHE_TYPE,
     }
+
+
+@app.post("/tokenize/count", summary="Count tokens in a text block")
+def count_tokens(text: str, model_type: str = "gemma"):
+    """
+    Count tokens using the globally cached TokenCalculator.
+    `model_type` options: 'gemma' (AutoTokenizer) or 'openai' (tiktoken)
+    """
+    if not hasattr(app.state, "token_calculator"):
+        raise HTTPException(status_code=503, detail="TokenCalculator not initialized yet")
+    
+    count = app.state.token_calculator.count_tokens(text, model_type)
+    return {"token_count": count, "model_type": model_type}
 
 
 @app.get("/")

@@ -20,7 +20,7 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 MarkupSafe==3.0.3
 narwhals==2.20.0
-numpy==2.4.4
+numpy==1.26.4
 packaging==26.2
 pandas==3.0.2
 pillow==12.2.0
@@ -50,4 +50,9 @@ tzdata==2026.2
 urllib3==2.6.3
 uvicorn==0.27.0
 watchdog==6.0.0
+redis==5.0.1
+transformers>=4.38.0
+tiktoken>=0.6.0
+sentencepiece>=0.1.99
+
 python-multipart
