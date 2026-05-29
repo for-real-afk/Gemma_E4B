@@ -29,6 +29,11 @@ services:
       - key: ALLOWED_ORIGINS
         sync: false
 
+      # Ollama embedding model for semantic PDF search (default: nomic-embed-text)
+      # Pull on your server first: ollama pull nomic-embed-text
+      - key: OLLAMA_EMBED_MODEL
+        value: "nomic-embed-text"
+
       # OpenAI — optional. Required only when GPT-4 is selected in the UI.
       - key: OPENAI_API_KEY
         sync: false

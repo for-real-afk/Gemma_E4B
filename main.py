@@ -55,6 +55,11 @@ if not OLLAMA_HOST or not OLLAMA_MODEL:
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override with gpt-4o, gpt-4, etc.
 
+# Ollama embedding model for semantic PDF search.
+# Pull on your server with: ollama pull nomic-embed-text
+# Falls back to keyword matching automatically if the model is not available.
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
 MAX_FILE_SIZE_MB = 3
 
 # ── per-session PDF chunk store ───────────────────────────────────────────────
@@ -374,13 +379,27 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     """
     from memory.tokenizer import TokenCalculator
     from memory.pdf_rag import retrieve_relevant_chunks
+    from memory.embeddings import embed_query
+    from memory.vector_store import get_store
 
-    # If this session has a PDF uploaded, re-run RAG with the current question
-    # and inject relevant chunks — so follow-up questions have full PDF context
-    # without requiring the user to re-upload the file.
+    # Re-run RAG for every follow-up question using the stored PDF from this session.
+    # Prefer semantic vector search; fall back to keyword matching if embeddings
+    # are not available (nomic-embed-text not pulled on Ollama server).
     pdf_context   = ""
     tokens_attach = 0
-    if req.session_id in _session_pdfs:
+
+    vector_store = get_store(req.session_id)
+    if vector_store and vector_store.ready:
+        # Semantic search path
+        q_embedding = await embed_query(req.message, OLLAMA_HOST, OLLAMA_EMBED_MODEL, OLLAMA_KEY or "")
+        if q_embedding:
+            pdf_context = vector_store.search(q_embedding, max_tokens=2000)
+        else:
+            # Embed query failed — fall through to keyword
+            pass
+
+    if not pdf_context and req.session_id in _session_pdfs:
+        # Keyword fallback
         pdf_context = retrieve_relevant_chunks(
             _session_pdfs[req.session_id],
             query      = req.message,
@@ -518,13 +537,31 @@ async def chat_file(
                 max_tokens = 3000,
             )
 
-            # Persist chunks so follow-up /chat requests can re-run RAG
-            # without the user needing to re-upload the PDF.
+            # Always store raw chunks for keyword fallback
             _session_pdfs[session_id] = chunks
 
+            # Try to embed all chunks for semantic search
+            from memory.embeddings import embed_texts
+            from memory.vector_store import VectorStore, set_store
+
+            embeddings = await embed_texts(chunks, OLLAMA_HOST, OLLAMA_EMBED_MODEL, OLLAMA_KEY or "")
+            if embeddings:
+                store = VectorStore()
+                store.add(chunks, embeddings)
+                set_store(session_id, store)
+                logger.info(
+                    "PDF: %d chunks embedded (semantic search active) for session %s",
+                    len(chunks), session_id,
+                )
+            else:
+                logger.info(
+                    "PDF: %d chunks stored (keyword fallback, embed model unavailable) for session %s",
+                    len(chunks), session_id,
+                )
+
             logger.info(
-                "PDF RAG: %d chunks stored for session %s, retrieved %d chars (~%d tokens) for query",
-                len(chunks), session_id, len(attach_text), len(attach_text) // 4,
+                "PDF RAG: retrieved %d chars (~%d tokens) for initial query",
+                len(attach_text), len(attach_text) // 4,
             )
 
             # Inject retrieved sections into the user message
@@ -605,6 +642,8 @@ async def chat_file(
 def clear_session(session_id: str):
     delete_session(session_id)
     _session_pdfs.pop(session_id, None)
+    from memory.vector_store import delete_store
+    delete_store(session_id)
     return {"deleted": True, "session_id": session_id}
 
 
