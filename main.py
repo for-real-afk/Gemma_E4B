@@ -57,6 +57,12 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override with gpt-4
 
 MAX_FILE_SIZE_MB = 3
 
+# ── per-session PDF chunk store ───────────────────────────────────────────────
+# Maps session_id → list of text chunks from the last uploaded PDF.
+# Kept in memory (lost on server restart — acceptable for demo).
+# Allows follow-up questions to re-run RAG without re-uploading the file.
+_session_pdfs: dict[str, list[str]] = {}
+
 # ── pricing ───────────────────────────────────────────────────────────────────
 USD_TO_INR = float(os.getenv("USD_TO_INR", "85.0"))
 
@@ -367,10 +373,28 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
       5. Summarize overflow in background    (after response is sent)
     """
     from memory.tokenizer import TokenCalculator
+    from memory.pdf_rag import retrieve_relevant_chunks
+
+    # If this session has a PDF uploaded, re-run RAG with the current question
+    # and inject relevant chunks — so follow-up questions have full PDF context
+    # without requiring the user to re-upload the file.
+    pdf_context   = ""
+    tokens_attach = 0
+    if req.session_id in _session_pdfs:
+        pdf_context = retrieve_relevant_chunks(
+            _session_pdfs[req.session_id],
+            query      = req.message,
+            max_tokens = 2000,
+        )
+
+    user_message = (
+        f"{req.message}\n\n[PDF Context from uploaded document]\n{pdf_context}"
+        if pdf_context else req.message
+    )
 
     messages, overflow, old_summary = add_turn_and_get_prompt(
         session_id   = req.session_id,
-        user_message = req.message,
+        user_message = user_message,
     )
 
     if _is_openai_model(req.model):
@@ -382,12 +406,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     record_assistant_reply(req.session_id, reply)
 
-    # Prefer Ollama's native counts (exact Gemma tokenization).
-    # Fall back to our cached tokenizer only when Ollama doesn't return them.
     calculator        = app.state.token_calculator
     tokenizer_type    = TokenCalculator.route_tokenizer(req.model)
     prompt_tokens     = result.get("prompt_tokens")     or calculator.count_messages_tokens(messages, req.model)
     completion_tokens = result.get("completion_tokens") or calculator.count_tokens(reply, tokenizer_type)
+    if pdf_context:
+        tokens_attach = calculator.count_tokens(pdf_context, tokenizer_type)
 
     cost = compute_cost(prompt_tokens, completion_tokens, req.model)
 
@@ -398,9 +422,9 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         _persist_query,
         req.user_id, req.session_id, req.model,
-        prompt_tokens, completion_tokens, 0,
+        prompt_tokens, completion_tokens, tokens_attach,
         latency_ms, cost["usd"], cost["inr"],
-        req.message[:500], False, None,
+        req.message[:500], bool(pdf_context), "pdf" if pdf_context else None,
     )
 
     return ChatResponse(
@@ -494,9 +518,13 @@ async def chat_file(
                 max_tokens = 3000,
             )
 
+            # Persist chunks so follow-up /chat requests can re-run RAG
+            # without the user needing to re-upload the PDF.
+            _session_pdfs[session_id] = chunks
+
             logger.info(
-                "PDF RAG: %d chunks total, retrieved %d chars (~%d tokens) for query",
-                len(chunks), len(attach_text), len(attach_text) // 4,
+                "PDF RAG: %d chunks stored for session %s, retrieved %d chars (~%d tokens) for query",
+                len(chunks), session_id, len(attach_text), len(attach_text) // 4,
             )
 
             # Inject retrieved sections into the user message
@@ -576,6 +604,7 @@ async def chat_file(
 @app.delete("/session/{session_id}", summary="Clear a session's memory")
 def clear_session(session_id: str):
     delete_session(session_id)
+    _session_pdfs.pop(session_id, None)
     return {"deleted": True, "session_id": session_id}
 
 
