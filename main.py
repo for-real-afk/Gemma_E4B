@@ -310,14 +310,20 @@ def _parse_ollama_response(raw: str) -> dict:
         parsed = [json.loads(l) for l in lines]
         content = "".join(p.get("message", {}).get("content", "") for p in parsed)
 
-        # Ollama returns actual model token counts in the final response object.
-        # These are exact Gemma SentencePiece counts — more accurate than any
-        # external tokenizer fallback.
-        final = parsed[-1] if parsed else {}
+        final             = parsed[-1] if parsed else {}
+        prompt_eval_count = final.get("prompt_eval_count")
+        eval_count        = final.get("eval_count")
+
+        # Debug log — shows exactly what Ollama reports vs visible text length
+        logger.info(
+            "[TOKEN DEBUG] visible_chars=%d  prompt_eval_count=%s  eval_count=%s  objects_in_response=%d",
+            len(content), prompt_eval_count, eval_count, len(parsed),
+        )
+
         return {
             "response":          content,
-            "prompt_tokens":     final.get("prompt_eval_count"),  # int | None
-            "completion_tokens": final.get("eval_count"),         # int | None
+            "prompt_tokens":     prompt_eval_count,
+            "completion_tokens": eval_count,
         }
     except Exception:
         raise HTTPException(500, "Invalid response from LLM")
