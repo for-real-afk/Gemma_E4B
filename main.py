@@ -312,35 +312,18 @@ def _parse_ollama_response(raw: str) -> dict:
 
         final             = parsed[-1] if parsed else {}
         prompt_eval_count = final.get("prompt_eval_count")
-        eval_count        = final.get("eval_count")
 
-        # Ollama's eval_count on some builds = total tokens evaluated during
-        # the generation pass (prompt context re-evaluated + new tokens).
-        # When that's the case, eval_count > prompt_eval_count and we need to
-        # subtract to get just the new tokens generated.
-        # When Ollama already returns only the new tokens, eval_count is small
-        # (< prompt_eval_count) and we use it directly.
-        if eval_count is not None and prompt_eval_count is not None:
-            if eval_count > prompt_eval_count:
-                # Total-evaluation mode: subtract prompt to get output only
-                completion_tokens = eval_count - prompt_eval_count
-            else:
-                # Output-only mode: eval_count is already just the reply tokens
-                completion_tokens = eval_count
-        elif eval_count is not None:
-            completion_tokens = eval_count
-        else:
-            completion_tokens = None   # will fall back to char estimate in endpoint
-
-        logger.debug(
-            "[TOKENS] prompt=%s  eval=%s  → completion=%s  chars=%d",
-            prompt_eval_count, eval_count, completion_tokens, len(content),
-        )
+        # Ollama's eval_count is unreliable for output — it accumulates session
+        # context on some builds and gives inflated numbers (91 or 210 for
+        # "New Delhi"). We intentionally ignore it.
+        #
+        # Input (prompt_eval_count) is accurate — it's the full context size.
+        # Output: caller falls back to tiktoken estimate via count_tokens(reply).
 
         return {
-            "response":          content,
-            "prompt_tokens":     prompt_eval_count,
-            "completion_tokens": completion_tokens,
+            "response":      content,
+            "prompt_tokens": prompt_eval_count,
+            "completion_tokens": None,   # force tiktoken fallback in endpoint
         }
     except Exception:
         raise HTTPException(500, "Invalid response from LLM")
