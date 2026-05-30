@@ -53,7 +53,7 @@ if not OLLAMA_HOST or not OLLAMA_MODEL:
 
 # OpenAI — optional. Required only when the frontend selects the gpt4 model.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override with gpt-4o, gpt-4, etc.
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-5-nano")  # override with gpt-4o, gpt-4, etc.
 
 # Ollama embedding model for semantic PDF search.
 # Pull on your server with: ollama pull nomic-embed-text
@@ -71,9 +71,14 @@ _session_pdfs: dict[str, list[str]] = {}
 # ── pricing ───────────────────────────────────────────────────────────────────
 USD_TO_INR = float(os.getenv("USD_TO_INR", "85.0"))
 
+# GPT-5 Nano pricing (model: gpt-5-nano)
+# Input: $1.10/1M tokens  |  Output: $4.40/1M tokens
+# Update these if OpenAI changes the rates.
 _MODEL_PRICING: dict[str, dict[str, float]] = {
-    "gemma": {"input": 0.10 / 1_000_000, "output": 0.40 / 1_000_000},
-    "gpt4":  {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
+    "gemma":    {"input": 0.10  / 1_000_000, "output": 0.40  / 1_000_000},
+    "gpt4":     {"input": 1.10  / 1_000_000, "output": 4.40  / 1_000_000},  # gpt-5-nano rates
+    "gpt5nano": {"input": 1.10  / 1_000_000, "output": 4.40  / 1_000_000},
+    "openai":   {"input": 1.10  / 1_000_000, "output": 4.40  / 1_000_000},
 }
 
 
@@ -296,7 +301,7 @@ async def call_openai_with_messages(messages: list[dict]) -> tuple[dict, float]:
 
 
 def _is_openai_model(model: str) -> bool:
-    return model.lower().strip() in ("gpt4", "gpt-4", "gpt")
+    return model.lower().strip() in ("gpt4", "gpt-4", "gpt", "gpt5nano", "gpt-5-nano", "gpt5", "openai")
 
 
 def _parse_ollama_response(raw: str) -> dict:
@@ -463,7 +468,12 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     )
 
     if _is_openai_model(req.model):
-        result, latency_ms = await call_openai_with_messages(messages)
+        if not OPENAI_API_KEY:
+            logger.warning("OpenAI model '%s' requested but OPENAI_API_KEY not set — falling back to Gemma.", req.model)
+            result, latency_ms = await call_llm_with_messages(messages)
+        else:
+            logger.info("Routing to OpenAI model=%s", OPENAI_MODEL)
+            result, latency_ms = await call_openai_with_messages(messages)
     else:
         result, latency_ms = await call_llm_with_messages(messages)
 
