@@ -314,16 +314,33 @@ def _parse_ollama_response(raw: str) -> dict:
         prompt_eval_count = final.get("prompt_eval_count")
         eval_count        = final.get("eval_count")
 
-        # Debug log — shows exactly what Ollama reports vs visible text length
-        logger.info(
-            "[TOKEN DEBUG] visible_chars=%d  prompt_eval_count=%s  eval_count=%s  objects_in_response=%d",
-            len(content), prompt_eval_count, eval_count, len(parsed),
+        # Ollama's eval_count on some builds = total tokens evaluated during
+        # the generation pass (prompt context re-evaluated + new tokens).
+        # When that's the case, eval_count > prompt_eval_count and we need to
+        # subtract to get just the new tokens generated.
+        # When Ollama already returns only the new tokens, eval_count is small
+        # (< prompt_eval_count) and we use it directly.
+        if eval_count is not None and prompt_eval_count is not None:
+            if eval_count > prompt_eval_count:
+                # Total-evaluation mode: subtract prompt to get output only
+                completion_tokens = eval_count - prompt_eval_count
+            else:
+                # Output-only mode: eval_count is already just the reply tokens
+                completion_tokens = eval_count
+        elif eval_count is not None:
+            completion_tokens = eval_count
+        else:
+            completion_tokens = None   # will fall back to char estimate in endpoint
+
+        logger.debug(
+            "[TOKENS] prompt=%s  eval=%s  → completion=%s  chars=%d",
+            prompt_eval_count, eval_count, completion_tokens, len(content),
         )
 
         return {
             "response":          content,
             "prompt_tokens":     prompt_eval_count,
-            "completion_tokens": eval_count,
+            "completion_tokens": completion_tokens,
         }
     except Exception:
         raise HTTPException(500, "Invalid response from LLM")
