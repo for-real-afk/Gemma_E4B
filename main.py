@@ -287,16 +287,27 @@ async def call_openai_with_messages(messages: list[dict]) -> tuple[dict, float]:
     content = data["choices"][0]["message"]["content"]
     usage   = data.get("usage", {})
 
+    completion_tokens = usage.get("completion_tokens", 0)
+    prompt_tokens     = usage.get("prompt_tokens", 0)
+
+    # Reasoning models (o1, o3, gpt-5-nano, etc.) think internally before
+    # replying. Reasoning tokens are billed but not shown to the user.
+    # completion_tokens = reasoning_tokens + visible_output_tokens
+    details           = usage.get("completion_tokens_details", {})
+    reasoning_tokens  = details.get("reasoning_tokens", 0)
+    visible_tokens    = completion_tokens - reasoning_tokens   # what the user actually sees
+
     logger.info(
-        "OpenAI latency=%.0f ms  model=%s  tokens=%d+%d",
+        "OpenAI latency=%.0f ms  model=%s  prompt=%d  completion=%d  reasoning=%d  visible=%d",
         latency_ms, OPENAI_MODEL,
-        usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+        prompt_tokens, completion_tokens, reasoning_tokens, visible_tokens,
     )
 
     return {
-        "response":          content,
-        "prompt_tokens":     usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
+        "response":                   content,
+        "prompt_tokens":              prompt_tokens,
+        "completion_tokens":          visible_tokens,       # shown in UI as Output Tokens
+        "completion_tokens_billed":   completion_tokens,    # full amount for cost calculation
     }, latency_ms
 
 
@@ -491,10 +502,13 @@ async def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     tokenizer_type    = TokenCalculator.route_tokenizer(req.model)
     prompt_tokens     = result.get("prompt_tokens")     or calculator.count_messages_tokens(messages, req.model)
     completion_tokens = result.get("completion_tokens") or calculator.count_tokens(reply, tokenizer_type)
+    # For reasoning models, bill on full completion (includes hidden thinking).
+    # completion_tokens is the visible output; completion_tokens_billed includes reasoning.
+    billed_completion = result.get("completion_tokens_billed") or completion_tokens
     if pdf_context:
         tokens_attach = calculator.count_tokens(pdf_context, tokenizer_type)
 
-    cost = compute_cost(prompt_tokens, completion_tokens, req.model)
+    cost = compute_cost(prompt_tokens, billed_completion, req.model)
 
     background_tasks.add_task(
         summarize_in_background,
@@ -672,8 +686,9 @@ async def chat_file(
     tokenizer_type    = TokenCalculator.route_tokenizer(model)
     prompt_tokens     = result.get("prompt_tokens")     or calculator.count_messages_tokens(messages, model)
     completion_tokens = result.get("completion_tokens") or calculator.count_tokens(reply, tokenizer_type)
+    billed_completion = result.get("completion_tokens_billed") or completion_tokens
     tokens_attach     = calculator.count_tokens(attach_text, tokenizer_type) if attach_text else 0
-    cost              = compute_cost(prompt_tokens, completion_tokens, model)
+    cost              = compute_cost(prompt_tokens, billed_completion, model)
 
     background_tasks.add_task(
         summarize_in_background,
