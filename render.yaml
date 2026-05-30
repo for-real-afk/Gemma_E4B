@@ -40,11 +40,11 @@ services:
 
       # OpenAI model to use (default: gpt-4o-mini)
       - key: OPENAI_MODEL
-        value: "gpt-4o-mini"
+        value: "gpt-5-nano"
 
       # ── Optional — safe to commit defaults ───────────────────────────────
       - key: USD_TO_INR
-        value: "85.0"
+        value: "94.9"
 
       - key: PYTHON_VERSION
         value: "3.12.3"
