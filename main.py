@@ -290,24 +290,29 @@ async def call_openai_with_messages(messages: list[dict]) -> tuple[dict, float]:
     completion_tokens = usage.get("completion_tokens", 0)
     prompt_tokens     = usage.get("prompt_tokens", 0)
 
-    # Reasoning models (o1, o3, gpt-5-nano, etc.) think internally before
-    # replying. Reasoning tokens are billed but not shown to the user.
-    # completion_tokens = reasoning_tokens + visible_output_tokens
-    details           = usage.get("completion_tokens_details", {})
-    reasoning_tokens  = details.get("reasoning_tokens", 0)
-    visible_tokens    = completion_tokens - reasoning_tokens   # what the user actually sees
+    # For display: count visible reply with tiktoken (same estimator used for Gemma).
+    # OpenAI's completion_tokens includes hidden reasoning tokens on gpt-5-nano,
+    # making "New Delhi." show as 12 or 620 tokens when it's really 4.
+    # tiktoken gives the actual visible token count accurately.
+    #
+    # For billing: use completion_tokens from OpenAI — that's what they charge.
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        visible_tokens = len(enc.encode(content))
+    except Exception:
+        visible_tokens = max(1, len(content) // 4)
 
     logger.info(
-        "OpenAI latency=%.0f ms  model=%s  prompt=%d  completion=%d  reasoning=%d  visible=%d",
-        latency_ms, OPENAI_MODEL,
-        prompt_tokens, completion_tokens, reasoning_tokens, visible_tokens,
+        "OpenAI latency=%.0f ms  model=%s  prompt=%d  billed=%d  visible=%d",
+        latency_ms, OPENAI_MODEL, prompt_tokens, completion_tokens, visible_tokens,
     )
 
     return {
         "response":                   content,
         "prompt_tokens":              prompt_tokens,
-        "completion_tokens":          visible_tokens,       # shown in UI as Output Tokens
-        "completion_tokens_billed":   completion_tokens,    # full amount for cost calculation
+        "completion_tokens":          visible_tokens,       # shown in UI — visible text only
+        "completion_tokens_billed":   completion_tokens,    # used for cost — what OpenAI charges
     }, latency_ms
 
 
